@@ -1,0 +1,114 @@
+# argocd_install.yaml (최종 통합 버전 - kubeconfig 경로 명시)
+---
+- name: Install ArgoCD on Kubernetes Cluster and get initial password
+  hosts: kubernetes_cluster # inventory.ini에 정의된 그룹 이름
+  become: yes # sudo 권한으로 원격 서버에서 실행
+
+  tasks:
+    # --- EC2 인스턴스 Python 라이브러리 설치 태스크 ---
+    - name: Update apt cache on EC2 instance
+      apt:
+        update_cache: yes
+
+    - name: Install python3-pip on EC2 instance
+      apt:
+        name: python3-pip
+        state: present
+
+    - name: Install kubernetes Python library on EC2 instance
+      pip:
+        name: kubernetes
+        state: present
+        extra_args: --break-system-packages
+    # --- Python 라이브러리 설치 태스크 끝 ---
+
+
+    - name: Ensure argocd namespace exists
+      kubernetes.core.k8s:
+        name: argocd
+        api_version: v1
+        kind: Namespace
+        state: present
+        kubeconfig: /etc/rancher/k3s/k3s.yaml # <-- kubeconfig 경로 추가
+
+    - name: Apply ArgoCD install manifests
+      kubernetes.core.k8s:
+        state: present
+        src: https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+        namespace: argocd
+        kubeconfig: /etc/rancher/k3s/k3s.yaml # <-- kubeconfig 경로 추가
+      register: argocd_install_result
+      until: argocd_install_result.changed # 설치가 완료될 때까지 대기
+      retries: 3 # 3회 재시도 (네트워크 문제 등 대비)
+      delay: 5 # 5초 간격으로 재시도
+
+    - name: Wait for ArgoCD pods to be ready
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: argocd
+        field_selectors:
+          - status.phase=Running # Running 상태의 파드만 필터링
+        kubeconfig: /etc/rancher/k3s/k3s.yaml # <-- kubeconfig 경로 추가
+      register: argocd_pods
+      until: argocd_pods.resources | length >= 5 # 최소한 5개의 핵심 ArgoCD 파드가 Running 상태인지 확인
+      retries: 20 # 총 100초까지 대기
+      delay: 5
+
+    - name: Get ArgoCD initial admin secret
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: argocd-initial-admin-secret
+        namespace: argocd
+        kubeconfig: /etc/rancher/k3s/k3s.yaml # <-- kubeconfig 경로 추가
+      register: argocd_secret
+
+    - name: Decode ArgoCD initial admin password
+      set_fact:
+        argocd_admin_password: "{{ argocd_secret.resources[0].data.password | b64decode }}"
+
+    - name: Display ArgoCD Access Information
+      debug:
+        msg: |
+          =============================================================================
+          >>> ArgoCD Installation Complete! <<<
+
+          [Accessing ArgoCD UI]
+          1. Go to your LOCAL PC's terminal.
+          2. Run port-forwarding (this terminal must stay open):
+             sudo kubectl port-forward svc/argocd-server -n argocd 8080:443
+
+          3. Open your web browser and go to:
+             http://localhost:8080
+
+          [ArgoCD Login Credentials]
+          Username: admin
+          Password: {{ argocd_admin_password }}  # <-- This is your initial admin password
+
+          =============================================================================
+          [NEXT STEPS: Manually Create ArgoCD Application]
+
+          1.  On your LOCAL PC, install ArgoCD CLI if not already installed:
+              MacOS: brew install argocd
+              Linux: curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64 && sudo chmod +x /usr/local/bin/argocd
+
+          2.  Login to ArgoCD CLI (from LOCAL PC's terminal, while port-forwarding is active):
+              argocd login localhost:8080 --username admin --password {{ argocd_admin_password }} --insecure
+
+          3.  Create the ArgoCD Application for ROMA (from LOCAL PC's terminal):
+              argocd app create roma-app \
+                --repo https://github.com/iamywl/ROMA.git \
+                --path k8s \
+                --dest-server https://kubernetes.default.svc \
+                --dest-namespace default \
+                --sync-policy automated \
+                --auto-prune --self-heal
+              # Replace 'https://github.com/iamywl/ROMA.git' with your actual repo URL if different.
+
+          4.  Monitor deployment status:
+              argocd app list
+              argocd app get roma-app
+              # Or check ArgoCD UI (http://localhost:8080) for 'roma-app' status.
+
+          =============================================================================

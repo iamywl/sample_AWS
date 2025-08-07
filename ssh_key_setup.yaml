@@ -1,0 +1,95 @@
+# ssh_key_setup.yaml
+---
+- name: Generate SSH Key for Jenkins in container and display public key
+  hosts: kubernetes_cluster # EC2 인스턴스 (Ansible 관리 노드)
+  become: yes # sudo 권한으로 실행
+
+  vars:
+    jenkins_container_name: jenkins # Jenkins 컨테이너 이름
+
+  tasks:
+    - name: Ensure .ssh directory exists in Jenkins home inside container
+      community.docker.docker_exec:
+        container_name: "{{ jenkins_container_name }}"
+        command: "mkdir -p /var/jenkins_home/.ssh && chmod 700 /var/jenkins_home/.ssh"
+        user: root # docker exec에 root 권한 필요
+
+    - name: Generate SSH key pair inside Jenkins container
+      community.docker.docker_exec:
+        container_name: "{{ jenkins_container_name }}"
+        # 이미 키가 존재하면 다시 생성하지 않음 (멱등성)
+        command: "ssh-keygen -t rsa -b 4096 -C 'jenkins@ROMA-CI-CD' -f /var/jenkins_home/.ssh/id_rsa_jenkins -N ''"
+        user: root # root 권한으로 키 생성
+      register: ssh_keygen_result
+      changed_when: ssh_keygen_result.rc != 0 or "Generating public/private rsa key pair." in ssh_keygen_result.stdout
+
+    - name: Set correct permissions for generated private key inside container
+      community.docker.docker_exec:
+        container_name: "{{ jenkins_container_name }}"
+        command: "chmod 600 /var/jenkins_home/.ssh/id_rsa_jenkins"
+        user: root
+
+    - name: Get SSH public key content from Jenkins container
+      community.docker.docker_exec:
+        container_name: "{{ jenkins_container_name }}"
+        command: "cat /var/jenkins_home/.ssh/id_rsa_jenkins.pub"
+        user: root # root 권한으로 읽기
+      register: jenkins_ssh_public_key
+
+    - name: Get SSH private key content from Jenkins container (for manual Jenkins Credential)
+      community.docker.docker_exec:
+        container_name: "{{ jenkins_container_name }}"
+        command: "cat /var/jenkins_home/.ssh/id_rsa_jenkins"
+        user: root # root 권한으로 읽기
+      register: jenkins_ssh_private_key
+
+    - name: Display SSH Public Key for GitHub registration
+      debug:
+        msg: |
+          =============================================================================
+          >>> SSH Public Key for GitHub (COPY THIS ENTIRE STRING): <<<
+
+          {{ jenkins_ssh_public_key.stdout }}
+
+          =============================================================================
+          [NEXT STEPS]
+
+          1.  Go to GitHub: https://github.com/settings/keys
+          2.  Click "New SSH key" or "Add SSH key".
+          3.  Title: Jenkins ROMA CI/CD
+          4.  Key: PASTE THE ABOVE PUBLIC KEY (ssh-rsa AAAA....)
+          5.  Click "Add SSH key".
+
+          =============================================================================
+
+    - name: Display SSH Private Key for Jenkins Credential registration (DO NOT SHARE!)
+      debug:
+        msg: |
+          =============================================================================
+          >>> SSH Private Key for Jenkins Credential (COPY THIS ENTIRE STRING): <<<
+          (This is highly sensitive. Do NOT share or commit!)
+
+          {{ jenkins_ssh_private_key.stdout }}
+
+          =============================================================================
+          [NEXT STEPS IN JENKINS]
+
+          1.  Go to Jenkins: http://{{ inventory_hostname }}:8080/credentials/store/system/domain/_/
+          2.  Click "+ Add Credentials".
+          3.  Kind: SSH Username with private key
+          4.  ID: github-ssh-key-for-roma
+          5.  Description: SSH Key for ROMA GitHub access
+          6.  Username: git # (IMPORTANT: use 'git' as username for SSH cloning from GitHub)
+          7.  Private Key: Select "Enter directly" and PASTE THE ABOVE PRIVATE KEY (-----BEGIN OPENSSH PRIVATE KEY----- ...)
+          8.  Click "Create".
+
+          =============================================================================
+          [FINAL JENKINS JOB CONFIGURATION]
+
+          1.  Go to ROMA-CI-CD-Pipeline Job -> Configure -> Pipeline tab.
+          2.  Repository URL: git@github.com:iamywl/ROMA.git # (Change to SSH URL)
+          3.  Credentials: Select "github-ssh-key-for-roma" (the new SSH Credential).
+          4.  Save the Job.
+          5.  Trigger a new build.
+
+          =============================================================================

@@ -1,0 +1,140 @@
+# k3s_install.yaml (최종 수정 - group_add 파라미터 제거)
+---
+- name: Install K3s, Docker, and Jenkins on EC2 instance
+  hosts: kubernetes_cluster # inventory.ini에 정의된 그룹 이름
+  become: yes # sudo 권한으로 원격 서버에서 실행
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install Docker
+      apt:
+        name: docker.io
+        state: present
+
+    - name: Start and enable Docker service
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add 'ubuntu' user to docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+
+    - name: Install K3s (Master and Worker on single node)
+      shell: |
+        curl -sfL https://get.k3s.io | sh -
+      args:
+        creates: /usr/local/bin/k3s # K3s가 이미 설치되어 있으면 재설치하지 않음
+
+    - name: Wait for Kubeconfig file to be present and non-empty
+      wait_for:
+        path: /etc/rancher/k3s/k3s.yaml # Kubeconfig 파일 경로
+        state: present
+        timeout: 60 # 60초까지 대기
+      delegate_to: "{{ inventory_hostname }}" # 이 태스크는 원격 EC2 인스턴스에서 실행
+      become: yes # 이 태스크에도 root 권한 필요
+
+    - name: Get Kubeconfig content from remote EC2 instance
+      slurp:
+        src: /etc/rancher/k3s/k3s.yaml # K3s 설치 후 생성되는 kubeconfig 파일 경로
+      register: kubeconfig_content_remote
+
+    - name: Ensure .kube directory exists locally on control node
+      file:
+        path: ~/.kube
+        state: directory
+        mode: '0700'
+      delegate_to: localhost # 이 태스크는 로컬 PC에서 실행
+
+    - name: Save Kubeconfig to local file (~/.kube/config) on control node
+      copy:
+        content: "{{ kubeconfig_content_remote['content'] | b64decode }}" # 원격에서 가져온 base64 디코딩
+        dest: "~/.kube/config"
+        mode: '0600'
+      delegate_to: localhost # 이 태스크는 로컬 PC에서 실행
+
+    - name: Update Kubeconfig server address to public IP on control node
+      replace:
+        path: "~/.kube/config"
+        regexp: '127.0.0.0' # 127.0.0.1이 아닌 127.0.0.0으로 변경하여 더 유연하게 매칭
+        replace: "{{ inventory_hostname }}" # Ansible이 인식한 현재 호스트의 IP (EC2 공인 IP)
+      delegate_to: localhost # 이 태스크는 로컬 PC에서 실행
+
+    - name: Verify K3s installation and node status on remote EC2 instance
+      command: sudo kubectl get nodes # sudo 추가하여 권한 문제 방지
+      register: kubectl_get_nodes_result # 변수명 변경하여 명확화
+      changed_when: false
+
+    - debug:
+        var: kubectl_get_nodes_result.stdout_lines # 변경된 변수명 사용
+
+    - name: Delete problematic helm-install-traefik pod if it exists
+      shell: "kubectl delete pod helm-install-traefik-8lbxs -n kube-system --ignore-not-found"
+      register: delete_traefik_pod_result
+      changed_when: "delete_traefik_pod_result.rc == 0 and 'deleted' in delete_traefik_pod_result.stdout"
+      failed_when: "delete_traefik_pod_result.rc != 0 and 'not found' not in delete_traefik_pod_result.stderr"
+
+    # --- Jenkins 설치 시작 ---
+    - name: Create Jenkins Docker volume
+      community.docker.docker_volume:
+        name: jenkins_home
+        state: present
+
+    - name: Run Jenkins Docker container
+      community.docker.docker_container:
+        name: jenkins
+        image: jenkins/jenkins:lts
+        state: started
+        restart_policy: on-failure
+        ports:
+          - "8080:8080"
+          - "50000:50000"
+        volumes:
+          - jenkins_home:/var/jenkins_home
+          - "/var/run/docker.sock:/var/run/docker.sock"
+        # group_add: ["{{ lookup('pipe', 'getent group docker | cut -d: -f3') }}"] # <-- 이 줄을 완전히 삭제합니다!
+
+    - name: Wait for Jenkins to start (give it some time)
+      pause:
+        minutes: 2
+
+    - name: Update apt cache inside Jenkins container
+      community.docker.docker_container_exec:
+        container_name: jenkins
+        command: "apt update"
+        user: root
+      register: jenkins_apt_update_result
+      changed_when: "jenkins_apt_update_result.retcode != 0"
+
+    - name: Install Docker CLI inside Jenkins container
+      community.docker.docker_container_exec:
+        container_name: jenkins
+        command: "apt install -y docker.io"
+        user: root
+      register: jenkins_docker_cli_install_result
+      changed_when: "jenkins_docker_cli_install_result.retcode != 0"
+
+    - name: Verify Docker CLI installation inside Jenkins container
+      community.docker.docker_container_exec:
+        container_name: jenkins
+        command: "docker --version"
+        user: root
+      register: jenkins_docker_cli_version
+      changed_when: false
+
+    - debug:
+        msg: "Docker CLI version inside Jenkins container: {{ jenkins_docker_cli_version.stdout }}"
+
+    - name: Display Jenkins connection info
+      debug:
+        msg: |
+          Jenkins has been started on http://{{ inventory_hostname }}:8080
+          You will need to get the initial admin password from the EC2 instance logs.
+          SSH into the EC2 instance and run:
+          sudo docker logs jenkins
